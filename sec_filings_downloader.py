@@ -44,34 +44,41 @@ LOG_PATH = None
 PROGRESS_PATH = None
 
 # 并发下载线程数
-# SEC 实际限制：每秒 10 个请求（每个 IP）
-# 3 线程 × 0.2s 间隔 ≈ 15 req/s 会触发 503
-# 推荐 2 线程 × 0.5s = 4 req/s，更稳妥
-MAX_WORKERS = 2
+# SEC 实际限制: 每秒 10 个请求 (每个 IP)
+# 3 线程 × 0.15s 间隔 ≈ 22 req/s 峰值, 有限流保护
+# 自适应机制会在连续 503 时自动降速, 所以这里可以激进一些
+MAX_WORKERS = 3
 
-# 起始年份
+# 起始年份 (用户要求 2000 年后)
 START_YEAR = 2000
 
-# 请求超时（秒）
-REQUEST_TIMEOUT = 120
+# 请求超时 (秒)
+REQUEST_TIMEOUT = 60
 
 # 最大重试次数
-MAX_RETRIES = 4
+MAX_RETRIES = 3
 
-# 基础退避时间（秒）
+# 基础退避时间 (秒)
 BASE_BACKOFF = 2
 
-# 请求间隔（秒），遵守SEC速率限制（每秒不超过10次）
-# 稳妥起见用 0.3s（每线程 3.3 req/s），远低于 10 req/s 限制
-REQUEST_DELAY = 0.3
+# 请求间隔 (秒), 遵守 SEC 速率限制 (每秒不超过 10 次)
+# 配合 3 线程 ≈ 22 req/s 峰值, 触发限流后自适应降速
+REQUEST_DELAY = 0.15
 
-# 最小文件大小（字节），小于此值视为无效
+# 最小文件大小 (字节), 小于此值视为无效
 MIN_FILE_SIZE = 5000
 
-# 全局速率自适应：连续 503 后自动降低请求频率
-# 连续 N 次 503 后，每个请求额外等待 PENALTY_SLEEP 秒
+# 全局速率自适应: 连续 503 后自动降低请求频率
+# 连续 N 次 503 后, 每个请求额外等待 PENALTY_SLEEP 秒
+# 自适应会临时把 REQUEST_DELAY 翻倍, 成功若干次后再恢复
 RATE_LIMIT_PENALTY_THRESHOLD = 3
-RATE_LIMIT_PENALTY_SLEEP = 5.0
+RATE_LIMIT_PENALTY_SLEEP = 3.0
+
+# 本地缓存目录 (存放 CIK{cik}.json 和历史分片, 减少重复请求)
+CACHE_DIR_NAME = "sec_cache"
+
+# 是否启用本地缓存 (True=启用, 减少网络请求和报错)
+USE_CACHE = True
 
 # ============================================================
 # ====================== 配置结束 ============================
@@ -107,6 +114,16 @@ _print_lock = Lock()
 _session = None
 _session_lock = Lock()
 
+# ============================================================
+#           全局速率自适应（连续 503 自动降速）
+# ============================================================
+# 思路：维护一个连续失败计数器，超过阈值就把请求间隔临时翻倍
+# 成功若干次后逐渐恢复
+_rate_state_lock = Lock()
+_consecutive_rate_limits = 0  # 连续 503/429 次数
+_consecutive_successes = 0    # 连续成功次数
+_current_delay_multiplier = 1.0  # 当前间隔倍数（1.0=正常, 2.0=翻倍）
+
 
 def get_session() -> requests.Session:
     """获取全局 Session（线程安全单例）"""
@@ -124,6 +141,43 @@ def get_session() -> requests.Session:
                 _session.mount("https://", adapter)
                 _session.mount("http://", adapter)
     return _session
+
+
+def _record_rate_limit_hit():
+    """记录一次限流事件, 触发自适应降速"""
+    global _consecutive_rate_limits, _consecutive_successes, _current_delay_multiplier
+    with _rate_state_lock:
+        _consecutive_rate_limits += 1
+        _consecutive_successes = 0
+        if _consecutive_rate_limits >= RATE_LIMIT_PENALTY_THRESHOLD:
+            # 翻倍间隔, 最多 4 倍 (即 0.15s × 4 = 0.6s)
+            _current_delay_multiplier = min(_current_delay_multiplier * 2.0, 4.0)
+
+
+def _record_success():
+    """记录一次成功请求, 连续成功后逐渐恢复正常间隔"""
+    global _consecutive_rate_limits, _consecutive_successes, _current_delay_multiplier
+    with _rate_state_lock:
+        _consecutive_rate_limits = 0
+        _consecutive_successes += 1
+        # 每 20 次成功就把倍数减半, 直到 1.0
+        if _consecutive_successes >= 20 and _current_delay_multiplier > 1.0:
+            _current_delay_multiplier = max(_current_delay_multiplier / 2.0, 1.0)
+            _consecutive_successes = 0
+
+
+def get_effective_delay() -> float:
+    """获取当前生效的请求间隔 (含自适应倍数)"""
+    with _rate_state_lock:
+        return REQUEST_DELAY * _current_delay_multiplier
+
+
+def rate_limited_sleep():
+    """自适应 sleep: 等待当前生效的间隔, 并在限流时额外等待"""
+    delay = get_effective_delay()
+    with _rate_state_lock:
+        penalty = RATE_LIMIT_PENALTY_SLEEP if _consecutive_rate_limits >= RATE_LIMIT_PENALTY_THRESHOLD else 0.0
+    time.sleep(delay + penalty)
 
 # 目标表单类型：10-K（美资公司年报）、20-F（外国公司年报）、N-CSR（基金/注册投资公司年报）
 TARGET_FORMS = {"10-K", "20-F", "10-K/A", "20-F/A", "N-CSR", "N-CSR/A"}
@@ -247,10 +301,12 @@ def retry_request(method: str, url: str, headers: dict,
 
             # 成功
             if 200 <= resp.status_code < 400:
+                _record_success()
                 return resp
 
             # 429 Too Many Requests — 严格遵守 Retry-After
             if resp.status_code == 429:
+                _record_rate_limit_hit()
                 retry_after = resp.headers.get("Retry-After")
                 if retry_after:
                     try:
@@ -269,6 +325,7 @@ def retry_request(method: str, url: str, headers: dict,
             # 503 Service Unavailable — SEC 网关限流
             # 这是最常见的错误，502/504 同理
             if resp.status_code in (502, 503, 504):
+                _record_rate_limit_hit()
                 wait = _compute_backoff(attempt, base=BASE_BACKOFF * 2)
                 # 503 至少等 5s
                 wait = max(wait, 5)
@@ -396,86 +453,186 @@ def load_tickers_from_csv(csv_path: str) -> list:
     return tickers
 
 
+def _cache_path(cik: str, kind: str = "submissions", extra: str = "") -> str:
+    """获取本地缓存文件路径"""
+    cache_dir = os.path.join(SAVE_ROOT, CACHE_DIR_NAME)
+    os.makedirs(cache_dir, exist_ok=True)
+    if extra:
+        # extra 形如 submissions_0001234_2014-10-31
+        # 清洗成安全文件名
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", extra)
+        return os.path.join(cache_dir, f"CIK{cik}_{kind}_{safe}.json")
+    return os.path.join(cache_dir, f"CIK{cik}_{kind}.json")
+
+
+def _read_cache(path: str, max_age_days: int = 7):
+    """读取本地缓存, 如果文件不存在或已过期则返回 None"""
+    if not USE_CACHE or not os.path.exists(path):
+        return None
+    try:
+        mtime = os.path.getmtime(path)
+        if (time.time() - mtime) > max_age_days * 86400:
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError, OSError):
+        return None
+
+
+def _write_cache(path: str, data):
+    """写入本地缓存"""
+    if not USE_CACHE:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except (IOError, OSError):
+        pass  # 缓存写入失败不影响主流程
+
+
+def _fetch_one_file_shard(file_entry: dict, start_year: int,
+                          logger: logging.Logger = None) -> list:
+    """拉取单个历史分片, 解析后返回 (year, form, ...) 列表"""
+    file_url = file_entry.get("name")
+    filing_from = file_entry.get("filingFrom", "")
+    filing_to = file_entry.get("filingTo", "")
+
+    # 早期跳过: 如果分片最大年份也 < start_year, 完全不需要请求
+    try:
+        if filing_to and int(filing_to[:4]) < start_year:
+            return []
+    except (ValueError, IndexError):
+        pass
+
+    if not file_url:
+        return []
+
+    # 尝试读缓存 (按 URL 的最后一段作为 key)
+    cache_key = file_url.rsplit("/", 1)[-1].replace(".json", "")
+    cache_p = _cache_path(file_url.split("/")[-3] if "/" in file_url else "x",
+                          kind="shard", extra=cache_key)
+    # 上面 cache_key 算出来可能不唯一, 这里用 file_url 的 hash 兜底
+    import hashlib
+    cache_key_hash = hashlib.md5(file_url.encode()).hexdigest()[:12]
+    cache_p = _cache_path(cik="shard", kind=cache_key_hash, extra=cache_key)
+
+    cached = _read_cache(cache_p, max_age_days=30)
+    if cached is not None:
+        return _parse_filing_records(cached, start_year)
+
+    try:
+        file_resp = retry_request("GET", file_url, HEADERS_DATA, logger=logger)
+        file_resp.raise_for_status()
+        file_data = file_resp.json()
+    except Exception as e:
+        if logger:
+            logger.debug(f"分片请求失败 {file_url}: {e}")
+        return []
+
+    _write_cache(cache_p, file_data)
+    return _parse_filing_records(file_data, start_year)
+
+
+def _parse_filing_records(file_data: dict, start_year: int) -> list:
+    """从分片 JSON 解析出目标年报记录列表"""
+    forms = file_data.get("form", [])
+    dates = file_data.get("filingDate", [])
+    accs = file_data.get("accessionNumber", [])
+    docs = file_data.get("primaryDocument", [])
+
+    out = []
+    for form, date_str, acc, doc in zip(forms, dates, accs, docs):
+        try:
+            filing_year = int(date_str.split("-")[0])
+        except (ValueError, IndexError):
+            continue
+        if filing_year < start_year:
+            continue
+        form_norm = form.strip().upper()
+        if form_norm in TARGET_FORMS:
+            out.append({
+                "year": filing_year,
+                "form": form_norm,
+                "filing_date": date_str,
+                "accession": acc,
+                "document": doc,
+            })
+    return out
+
+
 def fetch_all_filings(cik: str, start_year: int = START_YEAR,
                       logger: logging.Logger = None) -> dict:
     """
-    获取指定CIK公司从start_year起的所有10-K和20-F提交记录
-    同时读取 recent 和 files 接口以获取完整历史数据
-    返回: {年份: [filing_dict, ...]}
+    获取指定CIK公司从 start_year 起的所有 10-K / 20-F / N-CSR 提交记录
+    优化点:
+    1) 本地缓存: CIK{cik}.json 命中缓存则零网络请求
+    2) files 分片并发: 用小线程池并发拉所有历史分片 (老公司可能有 10+ 个)
+    3) 每个分片也有本地缓存
+    4) 早分片跳过: filingTo < start_year 的分片直接跳过, 不发请求
+
+    返回: {年份: [filing_dict, ...]} (内部已去重 + 按日期排序)
     """
     url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-    resp = retry_request("GET", url, HEADERS_DATA, logger=logger)
-    resp.raise_for_status()
-    data = resp.json()
+    cache_p = _cache_path(cik, kind="submissions")
+
+    # ---- 1) 读 CIK{cik}.json 缓存 ----
+    data = _read_cache(cache_p, max_age_days=7)
+
+    if data is None:
+        # 没有缓存, 走网络
+        try:
+            resp = retry_request("GET", url, HEADERS_DATA, logger=logger)
+            resp.raise_for_status()
+            data = resp.json()
+            _write_cache(cache_p, data)
+        except Exception as e:
+            if logger:
+                logger.error(f"获取 {url} 失败: {e}")
+            raise
 
     all_filings = []
 
-    # ---- 处理 recent 部分 ----
+    # ---- 2) 处理 recent 部分 ----
     recent = data.get("filings", {}).get("recent", {})
     if recent:
-        forms = recent.get("form", [])
-        dates = recent.get("filingDate", [])
-        accs = recent.get("accessionNumber", [])
-        docs = recent.get("primaryDocument", [])
-        for form, date_str, acc, doc in zip(forms, dates, accs, docs):
-            try:
-                filing_year = int(date_str.split("-")[0])
-            except (ValueError, IndexError):
-                continue
-            if filing_year < start_year:
-                continue
-            if form.strip().upper() in TARGET_FORMS:
-                all_filings.append({
-                    "year": filing_year,
-                    "form": form.strip().upper(),
-                    "filing_date": date_str,
-                    "accession": acc,
-                    "document": doc,
-                })
+        all_filings.extend(_parse_filing_records(recent, start_year))
 
-    # ---- 处理 files 部分（历史数据） ----
+    # ---- 3) 并发处理 files 分片 ----
     files = data.get("filings", {}).get("files", [])
-    for file_entry in files:
-        file_url = file_entry.get("name")
-        if not file_url:
-            continue
-        try:
-            file_resp = retry_request("GET", file_url, HEADERS_DATA, logger=logger)
-            file_resp.raise_for_status()
-            file_data = file_resp.json()
-        except Exception:
-            continue
-
-        forms = file_data.get("form", [])
-        dates = file_data.get("filingDate", [])
-        accs = file_data.get("accessionNumber", [])
-        docs = file_data.get("primaryDocument", [])
-
-        for form, date_str, acc, doc in zip(forms, dates, accs, docs):
+    if files:
+        # 早期跳过: filingTo 年份 < start_year 的分片直接丢弃
+        relevant_files = []
+        for f_entry in files:
+            filing_to = f_entry.get("filingTo", "")
             try:
-                filing_year = int(date_str.split("-")[0])
+                if filing_to and int(filing_to[:4]) < start_year:
+                    continue
             except (ValueError, IndexError):
-                continue
-            if filing_year < start_year:
-                continue
-            if form.strip().upper() in TARGET_FORMS:
-                all_filings.append({
-                    "year": filing_year,
-                    "form": form.strip().upper(),
-                    "filing_date": date_str,
-                    "accession": acc,
-                    "document": doc,
-                })
+                pass
+            relevant_files.append(f_entry)
 
-    # 按年份分组
+        if relevant_files:
+            # 用小线程池并发拉分片 (最多 4 个并发, 避免和主下载线程抢资源)
+            with ThreadPoolExecutor(max_workers=min(4, len(relevant_files))) as ex:
+                futures = [ex.submit(_fetch_one_file_shard, fe, start_year, logger)
+                           for fe in relevant_files]
+                for fut in as_completed(futures):
+                    try:
+                        all_filings.extend(fut.result())
+                    except Exception as e:
+                        if logger:
+                            logger.debug(f"分片处理异常: {e}")
+
+    # ---- 4) 按年份分组 + 去重 + 排序 ----
     yearly_filings = defaultdict(list)
     for f in all_filings:
         yearly_filings[f["year"]].append(f)
 
-    # 每年内部按日期排序，并去重（同一accession只保留一份）
     for yr in yearly_filings:
         seen = set()
         unique = []
+        # 按日期升序排, 同 accession 只留一份
         for f in sorted(yearly_filings[yr], key=lambda x: x["filing_date"]):
             if f["accession"] not in seen:
                 seen.add(f["accession"])
@@ -487,14 +644,27 @@ def fetch_all_filings(cik: str, start_year: int = START_YEAR,
 
 def select_best_filing(year_filings: list) -> dict:
     """
-    从某年的所有符合条件的filing中选择最佳的一份：
-    1. 优先选10-K（非/A），其次10-K/A，其次20-F（非/A），最后20-F/A
-    2. 如果同类型有多个，选日期最新的
+    从某年的所有符合条件的filing中选择最佳的一份（严格保证每年最多一份）:
+    1) 优先级: 10-K > 10-K/A > 20-F > 20-F/A > N-CSR > N-CSR/A
+    2) 同一 form 内如有多个 accession (重复提交), 取日期最新的那一份
+    3) 找不到任何目标 form 时返回 None (由调用方安全跳过)
     """
+    if not year_filings:
+        return None
     for target_form in FORM_PRIORITY:
         candidates = [f for f in year_filings if f["form"] == target_form]
-        if candidates:
-            return candidates[-1]  # 已按日期排序，取最新
+        if not candidates:
+            continue
+        # 同一 form 内再按 accession 去重 + 取日期最新
+        seen = set()
+        unique = []
+        for f in sorted(candidates, key=lambda x: x["filing_date"]):
+            if f["accession"] in seen:
+                continue
+            seen.add(f["accession"])
+            unique.append(f)
+        if unique:
+            return unique[-1]  # 最新一份
     return None
 
 
@@ -506,26 +676,57 @@ def build_edgar_url(cik: str, accession: str):
     return dir_url, acc_no_dash
 
 
+def _head_check(url: str, session=None, logger=None) -> bool:
+    """HEAD 请求快速验证 URL 是否存在 (200 + 足够大)"""
+    try:
+        sess = session or get_session()
+        resp = sess.head(url, headers=HEADERS_EDGAR, timeout=15, allow_redirects=True)
+        if resp.status_code == 200:
+            cl = resp.headers.get("Content-Length")
+            # 没有 Content-Length 头的, 视为可能可用
+            if cl is None or int(cl) >= MIN_FILE_SIZE:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def find_best_document_url(cik: str, accession: str, document_name: str,
                            logger: logging.Logger = None) -> tuple:
     """
-    在EDGAR索引页中查找最佳文档URL。
-    使用结构化解析 + 正则兜底，大幅提高匹配可靠性。
+    在 EDGAR 索引页中查找最佳文档URL。
+    优化:
+    1) primaryDocument 已知时, 按 (原扩展名, .html, .htm, .txt) 顺序逐个 HEAD 验证, 命中即返回
+    2) 全部失败才请求 index 页 (大文件, 慢)
+    3) index 页解析失败时, 用兜底 URL 列表再 HEAD 一遍
 
     返回: (下载URL, 文件扩展名) 或 (None, None)
     """
     dir_url, acc_no_dash = build_edgar_url(cik, accession)
 
-    # 优化1: 如果有 primaryDocument（来自 API），直接用，避免再发 index 页请求
+    # ---- 优化1: 有 primaryDocument, 直接用 ----
     if document_name and document_name.strip():
-        # primaryDocument 通常带扩展名，直接构建 URL
-        # 但优先尝试 .html（解析后的格式），失败再试 .htm
         base_name = document_name.rsplit(".", 1)[0] if "." in document_name else document_name
-        # 优先返回 .html 猜测 URL，让 download_filing 去验证
-        guessed_url = dir_url + base_name + ".html"
+        orig_ext = "." + document_name.rsplit(".", 1)[-1].lower() if "." in document_name else ""
+        # 候选扩展名优先级: 原扩展名 (如果合理) > .html > .htm > .txt
+        candidate_exts = []
+        if orig_ext and orig_ext in (".html", ".htm", ".txt"):
+            candidate_exts.append(orig_ext)
+        for ext in (".html", ".htm", ".txt"):
+            if ext not in candidate_exts:
+                candidate_exts.append(ext)
+
+        # 逐个 HEAD 验证 (优先用 .html 走快路径, SEC 几乎都是 html)
+        for ext in candidate_exts:
+            cand_url = dir_url + base_name + ext
+            if _head_check(cand_url, logger=logger):
+                if logger:
+                    logger.debug(f"primaryDocument HEAD 命中: {cand_url}")
+                return cand_url, ext
+
+        # primaryDocument 全部扩展名都失败, 才回退到 index 页
         if logger:
-            logger.debug(f"primaryDocument 优先: {guessed_url}")
-        return guessed_url, ".html"
+            logger.debug(f"primaryDocument HEAD 全失败: {base_name}, 回退 index 页")
 
     # 优化2: 没有 primaryDocument 才请求 index 页
     index_url = dir_url + f"{acc_no_dash}-index.html"
@@ -735,6 +936,22 @@ def process_ticker(ticker: str, ticker_to_cik: dict, progress: dict,
     """
     ticker_upper = ticker.upper()
 
+    # 顶层 try/except 兜底: 任何意外都不能卡死线程池
+    try:
+        return _process_ticker_inner(ticker, ticker_to_cik, progress, logger)
+    except Exception as e:
+        safe_print(f"  {ticker}: 处理严重异常 — {e}")
+        if logger:
+            logger.error(f"{ticker}: 顶层异常 — {e}")
+        progress[ticker_upper] = f"error:{type(e).__name__}"
+        return (ticker, 0, 1, 0)
+
+
+def _process_ticker_inner(ticker: str, ticker_to_cik: dict, progress: dict,
+                          logger: logging.Logger) -> tuple:
+    """process_ticker 的实际实现, 由外层 try/except 包裹"""
+    ticker_upper = ticker.upper()
+
     # 检查是否已完成（断点续传）
     if progress.get(ticker_upper) == "done":
         safe_print(f"  {ticker}: 已完成，跳过")
@@ -776,16 +993,21 @@ def process_ticker(ticker: str, ticker_to_cik: dict, progress: dict,
         progress[ticker_upper] = "done"
         return (ticker, 0, 0, 0)
 
-    # 下载
+    # 下载 (单份失败不卡死, 走下一年)
     company_success = 0
     company_fail = 0
     for filing in selected_filings:
-        if download_filing(cik, filing, company_dir, logger):
-            company_success += 1
-        else:
+        try:
+            if download_filing(cik, filing, company_dir, logger):
+                company_success += 1
+            else:
+                company_fail += 1
+        except Exception as e:
             company_fail += 1
-        # 公司内下载间隔（每次下载通常有 2-3 个 HTTP 请求）
-        time.sleep(REQUEST_DELAY)
+            if logger:
+                logger.error(f"{ticker} {filing.get('year')} 异常跳过: {e}")
+        # 公司内下载间隔 (自适应, 限流时自动加长)
+        rate_limited_sleep()
 
     # 记录结果
     progress[ticker_upper] = "done"
